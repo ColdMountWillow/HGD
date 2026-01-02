@@ -35,7 +35,7 @@ def test_unet():
     print(f"  Output: {noise_pred.shape}")
     print(f"  Mid features: {mid_feat.shape}")
     print(f"  Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-    print("  ✓ U-Net test passed!")
+    print("  [OK] U-Net test passed!")
     
     return True
 
@@ -78,7 +78,7 @@ def test_diffusion():
     with torch.no_grad():
         sample = diffusion.sample(cond[:1], use_ddim=True)
     print(f"  Sample: {sample.shape}")
-    print("  ✓ Diffusion test passed!")
+    print("  [OK] Diffusion test passed!")
     
     return True
 
@@ -109,7 +109,7 @@ def test_hypergraph_construction():
     # Verify membership sums to ~1
     membership_sum = memberships.sum(dim=-1).mean()
     print(f"    Avg membership sum: {membership_sum.item():.4f} (should be ~1.0)")
-    print("  ✓ Hypergraph construction test passed!")
+    print("  [OK] Hypergraph construction test passed!")
     
     return True
 
@@ -142,7 +142,7 @@ def test_hgnn():
     target_feat = torch.randn(B, N, D)
     src_enc, tgt_enc = dual_encoder(source_feat, target_feat, memberships, centers)
     print(f"  DualHypergraphEncoder - Source: {src_enc.shape}, Target: {tgt_enc.shape}")
-    print("  ✓ HGNN test passed!")
+    print("  [OK] HGNN test passed!")
     
     return True
 
@@ -196,7 +196,7 @@ def test_losses():
     struct_loss = HypergraphStructureLoss(num_clusters=9)
     loss, info = struct_loss(source_feat, target_feat)
     print(f"  HypergraphStructureLoss: {loss.item():.4f}")
-    print("  ✓ Losses test passed!")
+    print("  [OK] Losses test passed!")
     
     return True
 
@@ -270,7 +270,7 @@ def test_integration():
     print(f"  Diffusion loss: {diff_loss.item():.4f}")
     print(f"  Hypergraph loss: {hg_loss.item():.4f}")
     print(f"  Total loss: {total_loss.item():.4f}")
-    print("  ✓ Integration test passed!")
+    print("  [OK] Integration test passed!")
     
     return True
 
@@ -296,7 +296,7 @@ def main():
             result = test_fn()
             results.append((name, result))
         except Exception as e:
-            print(f"  ✗ {name} test failed: {e}")
+            print(f"  [FAIL] {name} test failed: {e}")
             results.append((name, False))
     
     # Summary
@@ -308,15 +308,15 @@ def main():
     total = len(results)
     
     for name, result in results:
-        status = "✓ PASSED" if result else "✗ FAILED"
+        status = "[OK] PASSED" if result else "[FAIL] FAILED"
         print(f"  {name}: {status}")
     
     print(f"\nTotal: {passed}/{total} tests passed")
     
     if passed == total:
-        print("\n🎉 All tests passed! Ready to train.")
+        print("\n*** All tests passed! Ready to train. ***")
     else:
-        print("\n⚠️ Some tests failed. Please check the errors above.")
+        print("\n!!! Some tests failed. Please check the errors above. !!!")
 
 
 if __name__ == "__main__":

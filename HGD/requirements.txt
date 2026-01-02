@@ -13,6 +13,9 @@ tensorboard>=2.12.0
 opencv-python>=4.8.0
 scikit-image>=0.21.0
 
+# For torch.compile (PyTorch 2.x)
+sympy>=1.12
+
 # Optional: for visualization
 matplotlib>=3.7.0
 

@@ -42,6 +42,27 @@ class GroupNorm32(nn.GroupNorm):
         return super().forward(x.float()).type(x.dtype)
 
 
+class Upsample(nn.Module):
+    """上采样模块"""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 3, padding=1)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, scale_factor=2, mode='nearest')
+        return self.conv(x)
+
+
+class Downsample(nn.Module):
+    """下采样模块"""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 3, stride=2, padding=1)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
 class ResBlock(nn.Module):
     """
     Residual Block with timestep embedding injection
@@ -54,9 +75,7 @@ class ResBlock(nn.Module):
         in_channels: int, 
         out_channels: int, 
         time_emb_dim: int,
-        dropout: float = 0.0,
-        up: bool = False,
-        down: bool = False
+        dropout: float = 0.0
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -82,18 +101,6 @@ class ResBlock(nn.Module):
             self.skip_conv = nn.Conv2d(in_channels, out_channels, 1)
         else:
             self.skip_conv = nn.Identity()
-            
-        # Up/Down sampling
-        self.up = up
-        self.down = down
-        if up:
-            self.h_upd = nn.Upsample(scale_factor=2, mode='nearest')
-            self.x_upd = nn.Upsample(scale_factor=2, mode='nearest')
-        elif down:
-            self.h_upd = nn.AvgPool2d(2)
-            self.x_upd = nn.AvgPool2d(2)
-        else:
-            self.h_upd = self.x_upd = nn.Identity()
     
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """
@@ -101,15 +108,10 @@ class ResBlock(nn.Module):
             x: (B, C_in, H, W)
             time_emb: (B, time_emb_dim)
         Returns:
-            (B, C_out, H', W') - H', W' depends on up/down
+            (B, C_out, H, W)
         """
         h = self.norm1(x)
         h = F.silu(h)
-        
-        if self.up or self.down:
-            h = self.h_upd(h)
-            x = self.x_upd(x)
-            
         h = self.conv1(h)
         
         # Add time embedding
@@ -204,6 +206,8 @@ class ConditionalUNet(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.attention_resolutions = attention_resolutions
         self.return_mid_features = return_mid_features
+        self.channel_mult = channel_mult
+        self.image_size = image_size
         
         # Time embedding
         time_emb_dim = model_channels * 4
@@ -218,79 +222,91 @@ class ConditionalUNet(nn.Module):
         self.domain_proj = nn.Linear(domain_embed_dim, time_emb_dim)
         
         # Input: concat x + condition
-        # 因此输入通道数是 in_channels * 2
         concat_channels = in_channels * 2
         
         # Initial conv
         self.input_conv = nn.Conv2d(concat_channels, model_channels, 3, padding=1)
         
-        # Encoder
+        # ==================== Encoder ====================
         self.encoder_blocks = nn.ModuleList()
         self.encoder_attns = nn.ModuleList()
+        self.encoder_downsamples = nn.ModuleList()
         
-        channels = [model_channels]
+        # 记录每个 skip 的通道数
+        self.skip_channels = [model_channels]
+        
         ch = model_channels
-        ds = 1  # current downsampling factor
+        current_res = image_size
         
         for level, mult in enumerate(channel_mult):
             out_ch = model_channels * mult
             
+            # ResBlocks at this level
+            level_blocks = nn.ModuleList()
+            level_attns = nn.ModuleList()
+            
             for _ in range(num_res_blocks):
-                self.encoder_blocks.append(
-                    ResBlock(ch, out_ch, time_emb_dim, dropout)
-                )
+                level_blocks.append(ResBlock(ch, out_ch, time_emb_dim, dropout))
                 ch = out_ch
-                channels.append(ch)
+                self.skip_channels.append(ch)
                 
                 # Add attention at specified resolutions
-                if image_size // ds in attention_resolutions:
-                    self.encoder_attns.append(AttentionBlock(ch, num_heads))
+                if current_res in attention_resolutions:
+                    level_attns.append(AttentionBlock(ch, num_heads))
                 else:
-                    self.encoder_attns.append(nn.Identity())
+                    level_attns.append(nn.Identity())
+            
+            self.encoder_blocks.append(level_blocks)
+            self.encoder_attns.append(level_attns)
             
             # Downsample (except last level)
             if level < len(channel_mult) - 1:
-                self.encoder_blocks.append(
-                    ResBlock(ch, ch, time_emb_dim, dropout, down=True)
-                )
-                channels.append(ch)
-                self.encoder_attns.append(nn.Identity())
-                ds *= 2
+                self.encoder_downsamples.append(Downsample(ch))
+                self.skip_channels.append(ch)
+                current_res //= 2
+            else:
+                self.encoder_downsamples.append(None)
         
-        # Middle block
+        # ==================== Middle ====================
         self.mid_block1 = ResBlock(ch, ch, time_emb_dim, dropout)
         self.mid_attn = AttentionBlock(ch, num_heads)
         self.mid_block2 = ResBlock(ch, ch, time_emb_dim, dropout)
         
-        # 记录 mid feature channels 用于 hypergraph
+        # 记录 mid feature channels
         self.mid_channels = ch
+        self.mid_resolution = current_res
         
-        # Decoder
+        # ==================== Decoder ====================
         self.decoder_blocks = nn.ModuleList()
         self.decoder_attns = nn.ModuleList()
+        self.decoder_upsamples = nn.ModuleList()
         
         for level, mult in list(enumerate(channel_mult))[::-1]:
             out_ch = model_channels * mult
             
+            # Upsample first (except for first decoder level which is same res as bottleneck)
+            if level < len(channel_mult) - 1:
+                self.decoder_upsamples.append(Upsample(ch))
+                current_res *= 2
+            else:
+                self.decoder_upsamples.append(None)
+            
+            level_blocks = nn.ModuleList()
+            level_attns = nn.ModuleList()
+            
+            # num_res_blocks + 1 because we need extra block to consume skip from downsample
             for i in range(num_res_blocks + 1):
-                skip_ch = channels.pop()
-                self.decoder_blocks.append(
-                    ResBlock(ch + skip_ch, out_ch, time_emb_dim, dropout)
-                )
+                skip_ch = self.skip_channels.pop()
+                level_blocks.append(ResBlock(ch + skip_ch, out_ch, time_emb_dim, dropout))
                 ch = out_ch
                 
-                if image_size // ds in attention_resolutions:
-                    self.decoder_attns.append(AttentionBlock(ch, num_heads))
+                if current_res in attention_resolutions:
+                    level_attns.append(AttentionBlock(ch, num_heads))
                 else:
-                    self.decoder_attns.append(nn.Identity())
+                    level_attns.append(nn.Identity())
             
-            # Upsample (except first level in reverse)
-            if level > 0:
-                self.decoder_blocks.append(
-                    ResBlock(ch, ch, time_emb_dim, dropout, up=True)
-                )
-                self.decoder_attns.append(nn.Identity())
-                ds //= 2
+            self.decoder_blocks.append(level_blocks)
+            self.decoder_attns.append(level_attns)
         
         # Output
         self.out_norm = GroupNorm32(32, ch)
@@ -348,15 +364,24 @@ class ConditionalUNet(nn.Module):
         h = torch.cat([x, cond], dim=1)
         h = self.input_conv(h)
         
-        # Encoder
+        # ==================== Encoder ====================
         skips = [h]
-        block_idx = 0
-        for block, attn in zip(self.encoder_blocks, self.encoder_attns):
-            h = block(h, t_emb)
-            h = attn(h)
-            skips.append(h)
         
-        # Middle
+        for level, (blocks, attns, downsample) in enumerate(
+            zip(self.encoder_blocks, self.encoder_attns, self.encoder_downsamples)
+        ):
+            # ResBlocks
+            for block, attn in zip(blocks, attns):
+                h = block(h, t_emb)
+                h = attn(h)
+                skips.append(h)
+            
+            # Downsample
+            if downsample is not None:
+                h = downsample(h)
+                skips.append(h)
+        
+        # ==================== Middle ====================
         h = self.mid_block1(h, t_emb)
         h = self.mid_attn(h)
         
@@ -365,13 +390,20 @@ class ConditionalUNet(nn.Module):
         
         h = self.mid_block2(h, t_emb)
         
-        # Decoder
-        for block, attn in zip(self.decoder_blocks, self.decoder_attns):
-            if skips:
+        # ==================== Decoder ====================
+        for level, (upsample, blocks, attns) in enumerate(
+            zip(self.decoder_upsamples, self.decoder_blocks, self.decoder_attns)
+        ):
+            # Upsample first (if not the first decoder level)
+            if upsample is not None:
+                h = upsample(h)
+            
+            # ResBlocks with skip connections
+            for block, attn in zip(blocks, attns):
                 skip = skips.pop()
                 h = torch.cat([h, skip], dim=1)
-            h = block(h, t_emb)
-            h = attn(h)
+                h = block(h, t_emb)
+                h = attn(h)
         
         # Output
         h = self.out_norm(h)
@@ -387,37 +419,46 @@ class ConditionalUNet(nn.Module):
         Returns:
             (C, H, W)
         """
-        num_downsamples = len([m for m in self.encoder_blocks if hasattr(m, 'down') and m.down])
-        spatial = input_size // (2 ** num_downsamples)
-        return (self.mid_channels, spatial, spatial)
+        return (self.mid_channels, self.mid_resolution, self.mid_resolution)
 
 
 # 测试代码
 if __name__ == "__main__":
-    # 测试 U-Net
-    model = ConditionalUNet(
-        in_channels=3,
-        out_channels=3,
-        model_channels=64,
-        channel_mult=(1, 2, 4),
-        num_res_blocks=2,
-        attention_resolutions=(16,),
-        image_size=128
-    )
+    print("Testing ConditionalUNet...")
     
-    B = 2
-    x = torch.randn(B, 3, 128, 128)
-    t = torch.randint(0, 1000, (B,))
-    cond = torch.randn(B, 3, 128, 128)
-    domain_id = torch.zeros(B, dtype=torch.long)
+    # 测试不同配置
+    configs = [
+        {"image_size": 64, "model_channels": 64, "channel_mult": (1, 2, 4)},
+        {"image_size": 128, "model_channels": 64, "channel_mult": (1, 2, 4)},
+        {"image_size": 256, "model_channels": 64, "channel_mult": (1, 2, 4, 8)},
+    ]
     
-    noise_pred, mid_feat = model(x, t, cond, domain_id)
-    print(f"Input shape: {x.shape}")
-    print(f"Output shape: {noise_pred.shape}")
-    print(f"Mid feature shape: {mid_feat.shape}")
-    print(f"Expected mid shape: {model.get_mid_feature_shape(128)}")
+    for cfg in configs:
+        print(f"\nConfig: {cfg}")
+        model = ConditionalUNet(
+            in_channels=3,
+            out_channels=3,
+            num_res_blocks=2,
+            attention_resolutions=(16, 8),
+            **cfg
+        )
+        
+        B = 2
+        size = cfg["image_size"]
+        x = torch.randn(B, 3, size, size)
+        t = torch.randint(0, 1000, (B,))
+        cond = torch.randn(B, 3, size, size)
+        domain_id = torch.zeros(B, dtype=torch.long)
+        
+        noise_pred, mid_feat = model(x, t, cond, domain_id)
+        print(f"  Input: {x.shape}")
+        print(f"  Output: {noise_pred.shape}")
+        print(f"  Mid features: {mid_feat.shape}")
+        print(f"  Expected mid shape: {model.get_mid_feature_shape(size)}")
+        
+        assert noise_pred.shape == x.shape, "Output shape mismatch!"
+        print(f"  ✓ Test passed!")
     
     # 参数量
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total_params / 1e6:.2f}M")
-
+    print(f"\nTotal parameters: {total_params / 1e6:.2f}M")

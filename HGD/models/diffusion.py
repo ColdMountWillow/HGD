@@ -268,9 +268,14 @@ class GaussianDiffusion(nn.Module):
                 dtype=torch.long, device=device
             )
             
-            for i, t in enumerate(timesteps):
+            for i in range(len(timesteps)):
+                t = timesteps[i].item()  # 转为 Python int
                 t_batch = torch.full((B,), t, device=device, dtype=torch.long)
-                t_prev = timesteps[i + 1] if i < len(timesteps) - 1 else torch.zeros_like(t_batch)
+                
+                if i < len(timesteps) - 1:
+                    t_prev = timesteps[i + 1].item()
+                else:
+                    t_prev = 0
                 t_prev_batch = torch.full((B,), t_prev, device=device, dtype=torch.long)
                 
                 x = self.ddim_sample_step(x, t_batch, t_prev_batch, cond, domain_id)
