@@ -1,0 +1,75 @@
+# RTX PRO 6000 96GB 优化配置
+# 此配置充分利用 96GB 显存
+
+# ============================================
+# 推荐参数 (256x256 图像)
+# ============================================
+
+model:
+  image_size: 256
+  model_channels: 192        # 增大模型容量 (默认128)
+  channel_mult: [1, 2, 4, 8]
+  num_res_blocks: 3          # 增加残差块 (默认2)
+  attention_resolutions: [32, 16, 8]  # 更多 attention 层
+  dropout: 0.0
+
+diffusion:
+  num_timesteps: 1000
+  beta_schedule: "cosine"    # cosine 通常比 linear 好
+  sampling_timesteps: 50     # DDIM 采样步数
+
+training:
+  batch_size: 48             # 大 batch (可尝试 32-64)
+  learning_rate: 2e-4        # 稍高的 lr 配合大 batch
+  num_epochs: 100
+  num_workers: 8
+  
+  # Loss 权重
+  lambda_diffusion: 1.0
+  lambda_hypergraph: 0.1
+
+hypergraph:
+  enabled: true
+  num_clusters: 16           # 可以用更多簇
+  hgnn_hidden_dim: 384       # 增大 HGNN 维度
+  temperature: 0.07
+
+# ============================================
+# 高分辨率配置 (512x512 图像)
+# ============================================
+# 取消下面注释使用
+
+# model:
+#   image_size: 512
+#   model_channels: 128
+#   channel_mult: [1, 2, 4, 8]
+#   num_res_blocks: 2
+#
+# training:
+#   batch_size: 12
+#   learning_rate: 1e-4
+
+# ============================================
+# 性能选项
+# ============================================
+performance:
+  use_amp: true              # 混合精度 (强烈推荐)
+  use_compile: true          # torch.compile (PyTorch 2.0+)
+  compile_mode: "reduce-overhead"  # 或 "max-autotune"
+  cudnn_benchmark: true
+  tf32: true                 # Ampere+ GPU 支持
+
+# ============================================
+# 显存估算 (256x256, batch=48)
+# ============================================
+# 模型参数:    ~0.5 GB
+# 激活值:      ~20-30 GB
+# 优化器状态:  ~1 GB
+# 梯度:        ~0.5 GB
+# 峰值:        ~35-45 GB
+# 
+# 还有大量余量用于:
+# - 更大的模型
+# - 更大的 batch
+# - 更高的分辨率
+
